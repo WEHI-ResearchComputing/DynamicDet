@@ -409,7 +409,39 @@ class Model(nn.Module):
         model_info(self, verbose, img_size)
 
 
-def parse_model(d, ch_b):  # model_dict, input_channels(3)
+def parse_model(d: dict, ch_b: list[int]):  # model_dict, input_channels(3)
+    """
+    Parses a model configuration dictionary and constructs the corresponding neural network architecture.
+
+    This function processes the model configuration `d` and builds the backbone, dual_backbone, head,
+    and head2 subnetworks. It dynamically determines channel widths, manages intermediate layer saving,
+    and prints a summary of the model's layers.
+
+    Args:
+        d (dict): The model configuration dictionary containing:
+            - "anchors": Anchor box configurations for object detection.
+            - "nc": Number of classes for classification.
+            - "depth_multiple": Depth multiplier for adjusting the number of layers.
+            - "width_multiple": Width multiplier for adjusting channel widths.
+            - "backbone": List of backbone layer configurations.
+            - "dual_backbone": List of dual_backbone layer configurations.
+            - "head": List of head layer configurations.
+            - "head2": List of head2 layer configurations.
+            - "b1_save": List of indices of intermediate backbone layers to save.
+            - "b2_save": List of indices of intermediate dual_backbone layers to save.
+        ch_b (list[int]): List of input channel widths for the backbone.
+
+    Returns:
+        tuple: A tuple containing:
+            - backbone (nn.Sequential): The constructed backbone network.
+            - save_b (list[int]): Sorted list of indices of saved backbone layers.
+            - dual_backbone (nn.Sequential): The constructed dual_backbone network.
+            - save_b2 (list[int]): Sorted list of indices of saved dual_backbone layers.
+            - head (nn.Sequential): The constructed head network.
+            - save_h (list[int]): Sorted list of indices of saved head layers.
+            - head2 (nn.Sequential): The constructed head2 network.
+            - save_h2 (list[int]): Sorted list of indices of saved head2 layers.
+    """
     logger.info('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
     anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
@@ -417,6 +449,9 @@ def parse_model(d, ch_b):  # model_dict, input_channels(3)
     layers_b, save_b, c2 = [], [], ch_b[-1]  # layers, savelist, ch_b out
 
     def _parse_layer(i, f, m, n, args):
+        """
+        constructs the module, m, and populates it with relevant information from i, f, args.
+        """
         m_ = nn.Sequential(*[m(*args) for _ in range(n)]) if n > 1 else m(*args) # module
         t = str(m)[8:-2].replace("__main__.", "") # module type
         nparams = sum([x.numel() for x in m_.parameters()]) # number params
@@ -424,8 +459,12 @@ def parse_model(d, ch_b):  # model_dict, input_channels(3)
         logger.info('%3s%18s%3s%10.0f  %-40s%-30s' % (i, f, n, nparams, t, args))  # print
         return m_
     
+    # save function scope for use with eval - need modules, nc, and anchors
     parent_scope = locals()
     def _eval_strings(m, args):
+        """
+        Used to convert names in the model YAML cfg to the corresponding object.
+        """
         args_ = deepcopy(args)
         for j, a in enumerate(args):
             try:
@@ -435,6 +474,10 @@ def parse_model(d, ch_b):  # model_dict, input_channels(3)
         return eval(m) if isinstance(m, str) else m, args_
     
     def _ch_from(f, prev_ch, this_ch):
+        """
+        Creates a list of channel widths that correspond to the previous or current network, based 
+        on the sign of f (the "from" index in the model config).
+        """
         chs = []
         for x in ([f] if isinstance(f, (int, str)) else f):
             if isinstance(x, str):
@@ -446,6 +489,9 @@ def parse_model(d, ch_b):  # model_dict, input_channels(3)
         return chs
 
     def _check_module_io(m, f, chs, args, n):
+        """
+        Determines the output channel widths, given a model, m, its args, and depth gain.
+        """
         c1, c2 = None, None
         if m in [nn.Conv2d, Conv, ConvCheckpoint, RepConv, DownC, SPPCSPC]:
             if f == 'input':
@@ -487,76 +533,104 @@ def parse_model(d, ch_b):  # model_dict, input_channels(3)
         
         return c1, c2, args
     
-    def _extend_layers(m_, f, prev_save, this_save, this_layers):
+    def _build_network(input_subnet, prev_ch: list[int], this_save: list[int], prev_save: list[int], ch_init: int = None):
+        """
+        This function iteratively processes each module defined in the `input_subnet`, building the 
+        corresponding layers, managing channel dimensions, and updating the lists of intermediate 
+        outputs to save for reuse. It supports dynamic adjustment of channel widths and 
+        selectively saves layers based on the configuration.
 
-        for x in ([f] if isinstance(f, (int, str)) else f):  # append to savelist
-            if isinstance(x, str):
-                continue
-            if x >= 0:
-                prev_save.extend([x])
-            elif x != -1:
-                this_save.extend([x % i])
-        this_layers.append(m_)
+        Args:
+            input_subnet (list): A list of tuples, each containing the following elements:
+                - f (int or list[int/str]): The index or indices for channel selection. Negative 
+                values select from `this_save`, positive values from `ch_plus`.
+                - n (int): The number of repetitions of the module, adjusted by a depth gain factor 
+                if greater than 1.
+                - m (str): The name of the module to be constructed.
+                - args_ (list): The arguments required by the module `m`.
+            prev_ch (list[int]): A list of channel dimensions from the previous subnetwork. Used to
+                check that the output channels match the input for modules, when connecting to the
+                previous subnetwork.
+            this_save (list): A list of intermediate outputs that need to be saved during the forward 
+                pass for potential use in later stages, from input_subnet.
+            prev_save (list): A list of intermediate layer outputs to save from the "previous" 
+                subnetwork.
+            ch_init (int, optional): The initial channel dimension for the network. If provided, it 
+                initializes the `ch_out` list with this value. Defaults to None.
 
-        return prev_save, this_save, this_layers
+        Returns:
+            tuple: A tuple containing:
+                - layers_out (list): The list of constructed layers in the network.
+                - ch_out (list[int]): The list of output channel dimensions for each layer.
+                - this_save (list[int]): The updated list of intermediate outputs to save from this
+                    subnetwork.
+                - prev_save (list[int]): The updated list of intermediate outputs to save from the
+                    previous subnetwork.
+        
+        Notes:
+            - The function handles dynamic channel assignment based on the sign of `f`, where 
+            negative values draw from `this_ch`, and positive values from `prev_ch`.
+            - The channel widths for each layer are determined and adjusted based on the module's 
+            requirements and the depth gain.
+            - Layers that need to be saved for future reuse are updated in `this_save` and 
+            `prev_save` based on their indices.
+        """
+        layers_out = []
+        ch_out = [ch_init] if ch_init else []
+        # iterate through each module defined in the yaml
+        for i, (f, n, m, args_) in enumerate(input_subnet):
+
+            # convert found strings into corresponding objects if possible
+            m, args = _eval_strings(m, args_)
+
+            # when f < 0, pull channel width from ch_minus
+            #      f > 0,                         ch_plus
+            chs = _ch_from(f, prev_ch, ch_out)
+
+            # depth gain
+            n = max(round(n * gd), 1) if n > 1 else n
+
+            # check input/output layer channel widths based on module
+            _, c2, args = _check_module_io(m, f, chs, args, n)
+            
+            # properly define module params
+            m_ = _parse_layer(i, f, m, n, args)
+            
+            # add module to layer
+            layers_out.append(m_)
+
+            # update which layers need to be saved.
+            for x in ([f] if isinstance(f, (int, str)) else f):  # append to savelist
+                if isinstance(x, str):
+                    continue
+                if x >= 0:
+                    prev_save.extend([x])
+                elif x != -1:
+                    this_save.extend([x % i])
+            
+            # reset ch_out if ch_init was supplied
+            if ch_init and i == 0: ch_out = []
+
+            # append current channel width
+            ch_out.append(c2)
+            
+        return layers_out, ch_out, this_save, prev_save
 
     # build backbone network
-    for i, (f, n, m, args_) in enumerate(d['backbone']):  # from, number, module, args
-        m, args = _eval_strings(m, args_)
-
-        n = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        if isinstance(f, int):
-            _, c2, args = _check_module_io(m, f, [ch_b], args, n)
-        else:
-            _, c2, args = _check_module_io(m, f, [ch_b]*len(f), args, n)
-            
-        m_ = _parse_layer(i, f, m, n, args)
-        save_b.extend(x % i for x in ([f] if isinstance(f, (int, str)) else f) if x != -1)  # append to savelist
-        layers_b.append(m_)
-        if i == 0:
-            ch_b = []
-        ch_b.append(c2)
+    save_b = []
+    layers_b, ch_b, save_b, _ = _build_network(d["backbone"], ch_b, save_b, save_b, ch_b[-1])
 
     # build dual_backbone network
-    layers_b2, save_b2 = [], []  # layers, savelist
-    ch_b2 = []
-    for i, (f, n, m, args_) in enumerate(d['dual_backbone']):  # from, number, module, args
-        m, args = _eval_strings(m, args_)
-
-        chs = _ch_from(f, ch_b, ch_b2)
-
-        n = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        _, c2, args = _check_module_io(m, f, chs, args, n)
-
-        m_ = _parse_layer(i, f, m, n, args)
-        save_b, save_b2, layers_b2 = _extend_layers(m_, f, save_b, save_b2, layers_b2)
-        ch_b2.append(c2)
+    save_b2 = []
+    layers_b2, ch_b2, save_b2, save_b = _build_network(d["dual_backbone"], ch_b, save_b2, save_b)
 
     # build head network
-    layers_h, save_h, ch_h = [], [], []
-    for i, (f, n, m, args_) in enumerate(d['head']):  # from, number, module, args
-        m, args = _eval_strings(m, args_)
-        chs = _ch_from(f, ch_b, ch_h)
-
-        n = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        _, c2, args = _check_module_io(m, f, chs, args, n)
-
-        m_ = _parse_layer(i, f, m, n, args)
-        save_b, save_h, layers_h = _extend_layers(m_, f, save_b, save_h, layers_h)
-        ch_h.append(c2)
+    save_h = []
+    layers_h, ch_h, save_h, save_b = _build_network(d["head"], ch_b, save_b2, save_b)
 
     # build head2 network
-    layers_h2, save_h2, ch_h2 = [], [], []
-    for i, (f, n, m, args_) in enumerate(d['head2']):  # from, number, module, args
-        m, args = _eval_strings(m, args_)
-        chs = _ch_from(f, ch_b2, ch_h2)
-
-        n = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        _, c2, args = _check_module_io(m, f, chs, args, n)
-
-        m_ = _parse_layer(i, f, m, n, args)
-        save_b2, save_h2, layers_h2 = _extend_layers(m_, f, save_b2, save_h2, layers_h2)
-        ch_h2.append(c2)
+    save_h2 = []
+    layers_h2, ch_h2, save_h2, save_b2 = _build_network(d["head2"], ch_b2, save_h2, save_b2)
 
     save_b.extend(d['b1_save'])
     save_b2.extend(d['b2_save'])
